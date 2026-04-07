@@ -1,0 +1,138 @@
+extensions:
+  health_check:
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+  filelog/sessions:
+    include:
+      - /var/log/openclaw/sessions/**/*.jsonl
+    start_at: beginning
+    operators:
+    - type: json_parser
+      parse_from: body
+      parse_to: body
+    - type: regex_parser
+      regex: '(?P<session_id>[a-f0-9-]+)\.jsonl$'
+      parse_from: attributes["log.file.name"]
+      on_error: send
+    - type: copy
+      from: body.type
+      to: attributes["event.type"]
+    - type: copy
+      from: body.id
+      to: attributes["event.id"]
+    - type: copy
+      from: body.timestamp
+      to: attributes["event.timestamp"]
+processors:
+  batch:
+    timeout: 2s
+    send_batch_size: 100
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+  # 只保留 processed 和 usage，用于推给 bridge
+  filter/only_openclaw:
+    spans:
+      include:
+        match_type: strict
+        span_names:
+          - "openclaw.message.processed"
+          - "openclaw.model.usage"
+  # 过滤掉 processed 和 usage，其他 span 正常上报 Langfuse
+  filter/drop_openclaw:
+    spans:
+      exclude:
+        match_type: strict
+        span_names:
+          - "openclaw.message.processed"
+          - "openclaw.model.usage"
+  transform/logs:
+    log_statements:
+      - context: log
+        statements:
+          - set(log.attributes["session.id"], log.attributes["session_id"]) where log.attributes["session_id"] != nil
+exporters:
+  debug:
+    verbosity: detailed
+  otlphttp/langfuse:
+    endpoint: "http://langfuse-web:3000/api/public/otel"
+    headers:
+      Authorization: "Basic ${env:LANGFUSE_AUTH}"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+  # 推给 bridge 的 HTTP 接口
+  otlphttp/bridge:
+    compression: none
+    encoding: json
+    endpoint: "http://langfuse-bridge:9099"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 10s
+  clickhouse:
+    endpoint: "http://clickhouse:8123"
+    username: "${env:CLICKHOUSE_USER}"
+    password: "${env:CLICKHOUSE_PASSWORD}"
+    database: openclaw1
+    logs_table_name: otel_logs
+    metrics_table_name: otel_metrics
+    create_schema: true
+    compress: gzip
+    timeout: 30s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+service:
+  telemetry:
+    logs:
+      level: debug
+  extensions: [health_check]
+  pipelines:
+    # pipeline 1：processed 和 usage span 推给 bridge
+    traces/bridge:
+      receivers:
+        - otlp
+      processors:
+        - memory_limiter
+        - filter/only_openclaw
+        - batch
+      exporters:
+        - otlphttp/bridge
+        - debug
+    # pipeline 2：其他 span 正常上报 Langfuse
+    traces/langfuse:
+      receivers:
+        - otlp
+      processors:
+        - memory_limiter
+        - filter/drop_openclaw
+        - batch
+      exporters:
+        - otlphttp/langfuse
+        - debug
+    metrics:
+      receivers:
+        - otlp
+      processors:
+        - memory_limiter
+        - batch
+      exporters:
+        - otlphttp/langfuse
+        - clickhouse
+        - debug
+    logs:
+      receivers:
+        - filelog/sessions
+      processors:
+        - memory_limiter
+        - transform/logs
+        - batch
+      exporters:
+        - clickhouse
+        - debug

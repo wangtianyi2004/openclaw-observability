@@ -1,0 +1,19 @@
+version: 1.2.1
+
+cache: true
+
+mcpSettings:
+  allowedDomains:
+    - "mcp-clickhouse"
+
+endpoints:
+  anthropic:
+    apiKey: "${ANTHROPIC_API_KEY}"
+    titleConvo: true
+    titleModel: "claude-haiku-4-5-20251001"
+
+mcpServers:
+  openclaw-clickhouse:
+    url: http://mcp-clickhouse:8000/sse
+    type: sse
+    timeout: 30000
